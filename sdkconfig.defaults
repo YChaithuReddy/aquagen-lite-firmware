@@ -1,0 +1,60 @@
+# AquaGen Lite — ESP-IDF default config (tuned for 4 MB flash, WiFi-only)
+
+# --- Flash / partition ---
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# --- App / OTA ---
+CONFIG_APP_ROLLBACK_ENABLE=y
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# --- FreeRTOS / watchdog ---
+# Main task runs the station loop AND the WireGuard setup (HTTPS register + crypto + netif
+# creation), which is stack-heavy. Default 3584 overflowed → crashes in esp_wireguard_connect.
+# Match the proven modbus_iot_gateway value (8192).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+
+# --- Brownout (230 V AC sites with frequent power dips) ---
+# Use the LEAST-sensitive threshold (LVL 0 ≈ 2.43 V) so normal supply sag on long cable runs
+# does NOT trip a brownout reset — matches modbus_iot_gateway. (LVL 7 ≈ 2.9 V was backwards: it
+# is the MOST sensitive and caused spurious reboots on the very power dips this is meant to ride out.)
+CONFIG_ESP_BROWNOUT_DET=y
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_0=y
+CONFIG_ESP_BROWNOUT_DET_LVL=0
+
+# --- WiFi ---
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+
+# --- mbedTLS: Azure needs TLS 1.2 + standard suites ---
+# NOTE: DYNAMIC_BUFFER / VARIABLE_BUFFER_LENGTH (RAM-saving) shrink the TLS RX buffer and make large
+# CDN TLS records (GitHub/Cloudflare ~16KB) fail mid-download with mbedtls -0x7100 (BAD_INPUT_DATA),
+# breaking OTA. The modbus_iot_gateway keeps both OFF + the full 16KB IN buffer, so its OTA works.
+# We match it: both OFF. (We have heap headroom — ~160KB free at runtime.)
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=n
+CONFIG_MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH=n
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+
+# --- MQTT ---
+CONFIG_MQTT_PROTOCOL_311=y
+
+# --- LittleFS (offline ring buffer; component pulled via idf_component.yml) ---
+CONFIG_LITTLEFS_MAX_PARTITIONS=1
+
+# --- WireGuard (esp_wireguard component) ---
+CONFIG_WIREGUARD_ESP_NETIF=y
+CONFIG_WIREGUARD_MAX_PEERS=4
+# CRITICAL for WireGuard on a WiFi-only build: esp_wireguard creates a RAW lwip netif whose
+# netif->state is the wireguard device. With LWIP_ESP_NETIF_DATA=0 (the default when neither
+# PPP nor bridge is enabled), esp_netif's global lwip callback misreads that state as an
+# esp_netif handle and crashes (LoadProhibited in esp_netif_internal_dhcpc_cb). Enabling the
+# bridge flips LWIP_ESP_NETIF_DATA to 1 so esp_netif uses a dedicated client-data slot and
+# safely ignores the WG netif. (The gateway got this for free via CONFIG_LWIP_PPP_SUPPORT.)
+CONFIG_ESP_NETIF_BRIDGE_EN=y
+
+# --- Logging ---
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y

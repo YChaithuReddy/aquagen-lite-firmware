@@ -1,0 +1,10 @@
+# AquaGen Lite - 4 MB flash partition table (FROZEN once devices ship - OTA cannot change this).
+# OTA-only layout (no factory app): first flash lands in ota_0.
+# nvs 36K (config+wg_id+boot_cnt), otadata 8K, phy 4K, ota_0/ota_1 ~1.81M each, littlefs 256K.
+# Name,     Type, SubType,  Offset,   Size
+nvs,        data, nvs,      0x9000,   0x9000
+otadata,    data, ota,      0x12000,  0x2000
+phy_init,   data, phy,      0x14000,  0x1000
+ota_0,      app,  ota_0,    0x20000,  0x1D0000
+ota_1,      app,  ota_1,    0x1F0000, 0x1D0000
+storage,    data, littlefs, 0x3C0000, 0x40000

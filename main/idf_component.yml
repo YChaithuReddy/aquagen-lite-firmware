@@ -1,0 +1,9 @@
+## Managed components for AquaGen Lite
+dependencies:
+  idf: ">=5.1"
+  # Offline telemetry ring buffer (no SD card on this hardware)
+  joltwallet/littlefs: ">=1.14.0"
+  # WireGuard VPN client for remote web-config + MQTT
+  trombik/esp_wireguard: ">=0.9.0"
+  # NOTE: no azure-sdk-for-c — SAS auth is done with raw mbedTLS (sas_token.c) and
+  # MQTT with esp-mqtt (azure_mqtt.c), so the Azure embedded SDK is not needed.
