@@ -51,6 +51,22 @@ void modbus_meter_init(uint32_t baud, const char *parity)
     ESP_LOGI(TAG, "UART2 @ %lu %s parity", (unsigned long)baud, parity);
 }
 
+void modbus_meter_reinit(void)
+{
+    if (s_baud == 0) return;   // never initialized → nothing to recover
+    // Stash the live settings, then clear the cache so modbus_meter_init() does NOT skip and
+    // actually tears down + reinstalls the driver (the whole point of a recovery reinit).
+    uint32_t baud = s_baud;
+    char parity[sizeof(s_parity)];
+    strlcpy(parity, s_parity, sizeof(parity));
+    s_baud = 0;
+    s_parity[0] = '\0';
+    modbus_meter_init(baud, parity);
+    s_stats.recoveries++;
+    ESP_LOGW(TAG, "RS485 driver re-initialized (self-heal recovery #%lu)",
+             (unsigned long)s_stats.recoveries);
+}
+
 // Modbus RTU CRC16 (poly 0xA001).
 static uint16_t crc16(const uint8_t *buf, int len)
 {

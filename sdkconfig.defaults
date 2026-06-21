@@ -17,6 +17,10 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_ESP_TASK_WDT_INIT=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+# Auto-REBOOT if a watchdog-subscribed task hangs >30s (matches modbus_iot_gateway's trigger_panic).
+# Without this a frozen task = silent brick on an unattended box. The main loop + buffer flush feed
+# the WDT; OTA download runs in its own (unsubscribed) task, so this never false-trips an update.
+CONFIG_ESP_TASK_WDT_PANIC=y
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
 
 # --- Brownout (230 V AC sites with frequent power dips) ---

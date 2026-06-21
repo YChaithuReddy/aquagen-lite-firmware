@@ -9,6 +9,11 @@
 // Initialize UART2 for RS485 at the given baud/parity. Call before reads; re-call to change line settings.
 void modbus_meter_init(uint32_t baud, const char *parity);
 
+// Force a full RS485 driver teardown + reinstall using the current baud/parity, even if unchanged.
+// Self-heal path: a wedged UART (EMI, framing-error pileup, meter power glitch) won't recover via
+// per-read retries — only a driver reinit (or reboot) clears it. Bumps the `recoveries` counter.
+void modbus_meter_reinit(void);
+
 typedef struct {
     bool   ok;            // true if read succeeded
     double consumption;   // parsed value (raw int32 * MODBUS_SCALE)
@@ -32,6 +37,7 @@ typedef struct {
     uint32_t timeouts;       // attempts with no / short reply
     uint32_t crc_errors;     // attempts with a CRC mismatch
     uint8_t  last_exception; // last Modbus exception code seen (0 = none)
+    uint32_t recoveries;     // RS485 driver self-heal re-inits performed
 } modbus_stats_t;
 
 const modbus_stats_t *modbus_meter_stats(void);

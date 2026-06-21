@@ -56,6 +56,8 @@ void app_config_load(void)
         get_str(h, "ap_pw",       s_cfg.ap_password,  sizeof(s_cfg.ap_password));
         get_str(h, "wifi_ssid",   s_cfg.wifi_ssid,    sizeof(s_cfg.wifi_ssid));
         get_str(h, "wifi_pw",     s_cfg.wifi_password,sizeof(s_cfg.wifi_password));
+        get_str(h, "site_name",   s_cfg.site_name,    sizeof(s_cfg.site_name));
+        get_str(h, "site_gps",    s_cfg.site_gps,     sizeof(s_cfg.site_gps));
 
         nvs_get_u32(h, "tel_int",  &s_cfg.telemetry_interval_s);
         nvs_get_u8 (h, "mb_retry", &s_cfg.modbus_retry_count);
@@ -96,6 +98,8 @@ void app_config_save(void)
     nvs_set_str(h, "ap_pw",      s_cfg.ap_password);
     nvs_set_str(h, "wifi_ssid",  s_cfg.wifi_ssid);
     nvs_set_str(h, "wifi_pw",    s_cfg.wifi_password);
+    nvs_set_str(h, "site_name",  s_cfg.site_name);
+    nvs_set_str(h, "site_gps",   s_cfg.site_gps);
     nvs_set_u32(h, "tel_int",    s_cfg.telemetry_interval_s);
     nvs_set_u8 (h, "mb_retry",   s_cfg.modbus_retry_count);
     nvs_set_u16(h, "mb_delay",   s_cfg.modbus_retry_delay_ms);

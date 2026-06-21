@@ -23,6 +23,8 @@ static int s_rid = 1;
 
 // Defined in main.c — number of unhealthy self-recovery reboots (fleet diagnostics).
 extern uint32_t app_restart_count(void);
+// Defined in main.c — true when the box is in boot-loop SAFE MODE (meter disabled, remote-only).
+extern bool app_safe_mode(void);
 // Defined in main.c — queues an OTA to run from the main task (can't stop MQTT from here).
 extern void ota_request(const char *url);
 // Defined in main.c — runtime config-web-UI request (lets the twin open config remotely).
@@ -186,6 +188,8 @@ void device_twin_report(void)
     cJSON *r = cJSON_CreateObject();
     cJSON_AddStringToObject(r, "firmware_version", FW_VERSION_STRING);
     cJSON_AddStringToObject(r, "device_id", cfg->device_id);
+    cJSON_AddStringToObject(r, "site_name", cfg->site_name);   // installer's site record
+    cJSON_AddStringToObject(r, "site_gps", cfg->site_gps);     // "lat,lon" captured at install
     cJSON_AddNumberToObject(r, "telemetry_interval", cfg->telemetry_interval_s);
     cJSON_AddNumberToObject(r, "modbus_retry_count", cfg->modbus_retry_count);
     cJSON_AddNumberToObject(r, "modbus_retry_delay", cfg->modbus_retry_delay_ms);
@@ -198,6 +202,7 @@ void device_twin_report(void)
     cJSON_AddNumberToObject(r, "min_free_heap", (double)esp_get_minimum_free_heap_size());
     cJSON_AddNumberToObject(r, "restart_count", (double)app_restart_count());
     cJSON_AddStringToObject(r, "reset_reason", reset_reason_str());
+    cJSON_AddBoolToObject(r, "safe_mode", app_safe_mode());   // true = boot-loop guard tripped
     cJSON_AddNumberToObject(r, "mqtt_reconnects", (double)azure_mqtt_reconnect_count());
     cJSON_AddNumberToObject(r, "telemetry_sent", (double)telemetry_sent_count());
     cJSON_AddNumberToObject(r, "telemetry_buffered", (double)telemetry_buffered_count());
@@ -212,6 +217,7 @@ void device_twin_report(void)
     cJSON_AddNumberToObject(r, "modbus_timeouts", (double)ms->timeouts);
     cJSON_AddNumberToObject(r, "modbus_crc_errors", (double)ms->crc_errors);
     cJSON_AddNumberToObject(r, "modbus_last_exception", (double)ms->last_exception);
+    cJSON_AddNumberToObject(r, "modbus_recoveries", (double)ms->recoveries);
 
     json = cJSON_PrintUnformatted(r);
     cJSON_Delete(r);

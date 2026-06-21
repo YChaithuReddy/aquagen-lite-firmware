@@ -7,6 +7,7 @@
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_task_wdt.h"
 #include "esp_log.h"
 
 static const char *TAG = "telemetry";
@@ -17,6 +18,14 @@ static const char *TAG = "telemetry";
 
 static uint32_t s_sent = 0;       // published to Azure (live + replayed)
 static uint32_t s_buffered = 0;   // written to the offline buffer (failed live send)
+static bool     s_clock_auth = true;   // is the wall clock NTP-authoritative? (set by main)
+static unsigned s_boot_id    = 0;      // current boot id, for provisional-record retiming
+
+void telemetry_set_clock(bool authoritative, unsigned boot_id)
+{
+    s_clock_auth = authoritative;
+    s_boot_id = boot_id;
+}
 uint32_t telemetry_sent_count(void)     { return s_sent; }
 uint32_t telemetry_buffered_count(void) { return s_buffered; }
 
@@ -56,8 +65,13 @@ bool telemetry_send(const meter_cfg_t *meter, const meter_reading_t *reading)
         ESP_LOGI(TAG, "    ✅ SENT to Azure IoT Hub (slave %u)", meter->slave_id);
         return true;
     }
-    // offline (or publish failed) → store-and-forward
-    flash_buffer_push(json);
+    // offline (or publish failed) → store-and-forward. If the clock isn't NTP-authoritative yet
+    // (e.g. rebooted offline on the software RTC), tag it provisional so it can be retimed exactly.
+    if (s_clock_auth) {
+        flash_buffer_push(json);
+    } else {
+        flash_buffer_push_provisional(json, s_boot_id, (long long)time(NULL));
+    }
     s_buffered++;
     ESP_LOGW(TAG, "    ⚠ MQTT not connected — buffered to flash (%u queued, will resend on reconnect)",
              (unsigned)flash_buffer_count());
@@ -70,6 +84,10 @@ static bool replay_send(const char *json, void *ctx)
     if (!azure_mqtt_is_connected()) return false;
     if (!azure_mqtt_publish_telemetry(json)) return false;
     s_sent++;
+    // A long outage can buffer hundreds of records; this replay runs in the WDT-subscribed main
+    // task, so feed the watchdog each send (300ms × N could otherwise exceed the 30s task-WDT
+    // once panic is enabled). esp_task_wdt_reset() is a harmless no-op if the task isn't subscribed.
+    esp_task_wdt_reset();
     vTaskDelay(pdMS_TO_TICKS(REPLAY_DELAY_MS));   // pace the flush to avoid Azure throttling
     return true;
 }

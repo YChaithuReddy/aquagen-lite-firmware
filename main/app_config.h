@@ -31,6 +31,10 @@ typedef struct {
     char wifi_ssid[33];
     char wifi_password[64];
 
+    // --- Install / site record (set by installer at finish; reported to Azure for the master sheet) ---
+    char site_name[64];        // site / school name
+    char site_gps[40];         // "lat,lon" captured at install
+
     // --- Meters ---
     meter_cfg_t meters[MAX_METERS];
 

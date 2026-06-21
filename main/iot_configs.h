@@ -9,7 +9,7 @@
 #define FW_VERSION_MAJOR 2
 #define FW_VERSION_MINOR 0
 #define FW_VERSION_PATCH 0
-#define FW_VERSION_STRING "2.1.1"
+#define FW_VERSION_STRING "2.3.5"
 
 // ---- Hardware pin map (keep identical to AquaGen board) ----
 #define PIN_RS485_RX     16   // UART2 RX  (Modbus)
@@ -69,6 +69,9 @@
 // ---- Reliability (ported from modbus_iot_gateway, tuned for the unattended fleet) ----
 #define NTP_RESYNC_INTERVAL_S      (24 * 60 * 60)   // re-sync the clock daily; drift breaks SAS tokens
 #define MQTT_RECOVERY_TIMEOUT_S    (30 * 60)        // MQTT down this long → self-reboot to recover
+// Modbus self-heal: a wedged RS485/UART won't recover via per-read retries.
+#define MODBUS_FAIL_REINIT         3   // consecutive all-failed read cycles → re-init the RS485 driver
+#define MODBUS_REINIT_MAX_REBOOT   4   // driver re-inits without any good read → self-reboot (last resort)
 
 // ---- SoftAP (config mode) ----
 // NOTE: these defaults only apply to a board flashed WITHOUT a baked NVS identity.

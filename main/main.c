@@ -10,6 +10,7 @@
  */
 #include <stdio.h>
 #include <time.h>
+#include <sys/time.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -26,13 +27,16 @@
 #include "app_config.h"
 #include "leds.h"
 #include "wifi_mgr.h"
+#include "dns_server.h"
 #include "modbus_meter.h"
 #include "azure_mqtt.h"
 #include "telemetry.h"
+#include "flash_buffer.h"
 #include "provisioning.h"
 #include "device_twin.h"
 #include "ota.h"
 #include "web_config.h"
+#include "log_capture.h"
 #include "wireguard_client.h"
 
 static const char *TAG = "main";
@@ -83,6 +87,86 @@ static void bump_restart_count(void)
 
 // Exposed to device_twin.c for the reported-properties block.
 uint32_t app_restart_count(void) { return s_restart_count; }
+
+// ---- Boot-loop protection / SAFE MODE (critical for unattended remote boxes) ----
+// A config/data-driven crash that fires every boot would loop forever and brick an un-visitable box.
+// We persist a "consecutive unhealthy boots" counter: bumped at every boot, reset only after the box
+// has run healthy (MQTT up) for a sustained time. If it exceeds the threshold the box enters SAFE
+// MODE — it SKIPS the risky parts (boot meter self-test + Modbus reads, the most likely crash source)
+// but KEEPS WiFi + WireGuard + Azure + OTA + the web server up, so it stays fully remotely fixable.
+#define BOOT_FAIL_SAFE_THRESHOLD  5
+#define BOOT_HEALTHY_AFTER_MS     (3 * 60 * 1000)   // uptime w/ MQTT before clearing the counter
+static bool s_safe_mode = false;
+bool app_safe_mode(void) { return s_safe_mode; }      // reported to the Device Twin
+
+static uint32_t boot_fail_get(void)
+{
+    nvs_handle_t h; uint32_t v = 0;
+    if (nvs_open("aquagen", NVS_READONLY, &h) == ESP_OK) { nvs_get_u32(h, "boot_fail", &v); nvs_close(h); }
+    return v;
+}
+static void boot_fail_set(uint32_t v)
+{
+    nvs_handle_t h;
+    if (nvs_open("aquagen", NVS_READWRITE, &h) == ESP_OK) { nvs_set_u32(h, "boot_fail", v); nvs_commit(h); nvs_close(h); }
+}
+
+// ── Software RTC (no battery-backed RTC chip on this HW) ──────────────────────────────────────
+// Persist the wall clock to NVS so a power-loss-while-offline reboot doesn't reset time to 1970.
+// On boot we restore it (near-correct), NTP later corrects it exactly, and any offline records
+// stamped before that correction are retimed by the constant offset (clock_check_sync).
+#define TIME_VALID_FLOOR  1735689600LL   // 2025-01-01 UTC; epoch below this = clock not real yet
+static uint32_t s_boot_id    = 0;
+static int64_t  s_prov_base  = 0;        // restored epoch anchored to uptime 0 (0 = none restored)
+static bool     s_clock_auth = false;    // is the wall clock NTP-authoritative this boot?
+
+static uint32_t boot_id_next(void)
+{
+    nvs_handle_t h; uint32_t v = 0;
+    if (nvs_open("aquagen", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_get_u32(h, "boot_seq", &v); v++;
+        nvs_set_u32(h, "boot_seq", v); nvs_commit(h); nvs_close(h);
+    }
+    return v;
+}
+
+static void clock_save(void)
+{
+    if ((int64_t)time(NULL) < TIME_VALID_FLOOR) return;   // never persist a bogus clock
+    nvs_handle_t h;
+    if (nvs_open("aquagen", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u64(h, "rtc_epoch", (uint64_t)time(NULL)); nvs_commit(h); nvs_close(h);
+    }
+}
+
+static void clock_restore(void)
+{
+    nvs_handle_t h; uint64_t e = 0;
+    if (nvs_open("aquagen", NVS_READONLY, &h) == ESP_OK) { nvs_get_u64(h, "rtc_epoch", &e); nvs_close(h); }
+    if ((int64_t)e > TIME_VALID_FLOOR) {
+        struct timeval tv = { .tv_sec = (time_t)e, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+        s_prov_base = (int64_t)e - esp_timer_get_time() / 1000000;   // epoch at uptime 0
+        ESP_LOGW(TAG, "software RTC restored: %lld (provisional until NTP)", (long long)e);
+    }
+}
+
+// Detect the provisional→authoritative transition. On it, retime this boot's buffered records by
+// the constant offset (a software-RTC clock runs at the right rate, just shifted by the downtime).
+static void clock_check_sync(void)
+{
+    if (s_clock_auth) return;
+    if ((int64_t)time(NULL) <= TIME_VALID_FLOOR) return;   // still no real time
+    int64_t up = esp_timer_get_time() / 1000000, real = (int64_t)time(NULL);
+    if (s_prov_base > 0) {
+        int64_t delta = real - (s_prov_base + up);   // same offset for every provisional record
+        if (delta != 0) flash_buffer_retime(s_boot_id, delta);
+    }
+    s_clock_auth = true;
+    telemetry_set_clock(true, s_boot_id);
+    clock_save();
+    ESP_LOGW(TAG, "clock authoritative (%lld) — offline records retimed", (long long)real);
+}
 
 // ---- OTA request queue ----
 // The Device Twin handler runs in the MQTT task, and the /ota web handler in the httpd task.
@@ -172,8 +256,12 @@ static void run_station_mode(void)
     app_config_t *cfg = app_config_get();
     leds_state_wifi_ok();
 
+    s_boot_id = boot_id_next();
+    clock_restore();             // seed the clock from NVS so we're never at 1970 if NTP can't run
     sync_time();
     telemetry_init();            // mounts the LittleFS offline buffer
+    telemetry_set_clock(s_clock_auth, s_boot_id);   // provisional until NTP confirmed below
+    clock_check_sync();          // if NTP synced at boot → mark authoritative + retime any backlog
 
     // WireGuard (optional remote access) — disabled by default; crashes on esp_wireguard 0.9.0 +
     // IDF 5.5. Telemetry/config don't need it. See ENABLE_WIREGUARD in iot_configs.h.
@@ -207,29 +295,29 @@ static void run_station_mode(void)
     int64_t boot_ms   = esp_timer_get_time() / 1000;
     int64_t last_mqtt_ok = boot_ms;   // for connectivity auto-recovery
     int64_t last_ntp     = boot_ms;   // for daily clock re-sync
+    int64_t last_clk_save = boot_ms;  // for periodic software-RTC persistence
     int     heap_low_streak   = 0;    // consecutive low-heap checks (low-memory safety net)
+    int     mb_consec_fail    = 0;    // consecutive all-failed Modbus read cycles (self-heal)
+    int     mb_reinit_count   = 0;    // RS485 driver re-inits since the last good read
     int64_t config_open_ms    = 0;    // when the config web UI was opened (for idle auto-close)
     bool    prev_web_req      = false;
     int64_t last_btn_ms       = 0;    // last config-button toggle (edge debounce)
+    bool    boot_marked_healthy = false;  // boot-loop counter cleared once sustained-healthy
 
     while (1) {
         int64_t now = esp_timer_get_time() / 1000;
 
-        // Queued OTA (from the Device Twin or /ota web handler, which run in other tasks).
-        // Run it HERE in the main task — esp_mqtt_client_stop() must not be called from the
-        // MQTT task. ota_start() reboots on success; on failure we fall through and keep running.
+        // Queued OTA (from the Device Twin or /ota web handler, which run in other tasks; SAFE MODE
+        // still allows OTA — it's how a remote box gets repaired). ota_start() runs the download in
+        // its OWN background task: it reboots the chip on success, or just ends on failure. We keep
+        // MQTT UP throughout (≈150 KB free, OTA needs 40 KB) so a FAILED OTA never takes the box
+        // offline — telemetry keeps flowing. No esp_mqtt_client_stop() here (that must not run from
+        // the MQTT/httpd task anyway — hence the queue).
         if (s_ota_pending) {
             s_ota_pending = false;
-            ESP_LOGW(TAG, "performing queued OTA: %s", s_pending_ota_url);
-            device_twin_report();    // report status before we drop MQTT
-            azure_mqtt_stop();       // free TLS/heap budget for OTA on 4 MB
-            ota_start(s_pending_ota_url);   // reboots on SUCCESS; returns only on FAILURE
-            // OTA failed (download dropped, etc.) → bring Azure back up immediately so telemetry
-            // keeps flowing live. Without this the box would buffer every reading until the next
-            // SAS expiry / WiFi drop. A failed OTA must NOT take the box offline.
-            ESP_LOGW(TAG, "OTA did not complete — restarting Azure MQTT");
-            azure_mqtt_start();
-            continue;
+            ESP_LOGW(TAG, "starting OTA (background task): %s", s_pending_ota_url);
+            device_twin_report();           // report current ota_status first
+            ota_start(s_pending_ota_url);
         }
 
         // Config button — EXACTLY the modbus_iot_gateway model: PURE EDGE-TRIGGERED. The ISR sets
@@ -313,10 +401,26 @@ static void run_station_mode(void)
             ota_mark_valid_if_pending();  // healthy boot reached → cancel OTA rollback
             device_twin_request();        // fetch desired props
             device_twin_report();         // report current state
-            telemetry_flush_buffer();     // drain offline records on (re)connect
         }
         was_mqtt = mqtt;
-        if (mqtt) last_mqtt_ok = now;
+        if (mqtt) {
+            last_mqtt_ok = now;
+            // Drain buffered readings whenever online — OLDEST-FIRST (chronological), exactly like
+            // the gateway. Runs every loop (cheap no-op if empty) so records buffered while online,
+            // or a replay that stalled on a transient Azure error, get sent promptly — not only on
+            // the next reconnect. flash_buffer replays top-of-file (oldest) → newest; each record
+            // also carries its real created_on timestamp.
+            telemetry_flush_buffer();
+        }
+
+        // Boot-loop protection: once we've been healthy (MQTT up) for a sustained window, clear the
+        // consecutive-unhealthy-boot counter — this boot is proven good, so a future crash starts
+        // counting fresh and a healthy box never trips safe mode.
+        if (!boot_marked_healthy && mqtt && (now - boot_ms) >= BOOT_HEALTHY_AFTER_MS) {
+            boot_fail_set(0);
+            boot_marked_healthy = true;
+            ESP_LOGI(TAG, "boot confirmed healthy — boot-loop counter cleared");
+        }
 
         // Daily NTP re-sync — clock drift would eventually invalidate SAS tokens.
         if (now - last_ntp >= (int64_t)NTP_RESYNC_INTERVAL_S * 1000) {
@@ -324,6 +428,11 @@ static void run_station_mode(void)
             esp_sntp_restart();
             last_ntp = now;
         }
+
+        // Software RTC: if NTP only synced now (booted offline), mark authoritative + retime the
+        // backlog; and persist the clock every ~5 min so a power-loss reboot restores recent time.
+        clock_check_sync();
+        if (s_clock_auth && now - last_clk_save >= 300000) { clock_save(); last_clk_save = now; }
 
         // Connectivity auto-recovery — MQTT stuck-down this long → reboot to self-heal.
         // (Keyed on MQTT, NOT on meter reads: a reboot fixes a wedged WiFi/MQTT stack but
@@ -335,16 +444,39 @@ static void run_station_mode(void)
             esp_restart();
         }
 
-        if (!cfg->maintenance_mode && now >= next_send) {
+        // Skip the Modbus path entirely in safe mode (likely repeating-crash source) — the box
+        // stays online + remotely fixable; resume normal reads after a remote repair + reboot.
+        if (!s_safe_mode && !cfg->maintenance_mode && now >= next_send) {
+            bool any_attempt = false, any_ok = false;
             for (int i = 0; i < MAX_METERS; i++) {
                 meter_cfg_t *m = &cfg->meters[i];
                 if (!m->enabled) continue;
+                any_attempt = true;
                 meter_reading_t r = modbus_meter_read(m, cfg->modbus_retry_count, cfg->modbus_retry_delay_ms);
                 if (r.ok) {
+                    any_ok = true;
                     telemetry_send(m, &r);   // publishes live, or buffers to flash if offline
                 } else {
                     led_blink(LED_RED, 50, 2);
                 }
+            }
+            // Modbus self-heal: per-read retries can't fix a wedged RS485/UART. After N consecutive
+            // all-failed cycles, re-init the driver; if it stays dead across several re-inits, reboot.
+            if (any_attempt && !any_ok) {
+                if (++mb_consec_fail % MODBUS_FAIL_REINIT == 0) {
+                    if (++mb_reinit_count >= MODBUS_REINIT_MAX_REBOOT) {
+                        ESP_LOGE(TAG, "Modbus dead after %d re-inits — self-recovery reboot (#%lu)",
+                                 mb_reinit_count, (unsigned long)(s_restart_count + 1));
+                        bump_restart_count();
+                        esp_restart();
+                    }
+                    ESP_LOGW(TAG, "Modbus: %d consecutive failed reads — re-initializing RS485 driver",
+                             mb_consec_fail);
+                    modbus_meter_reinit();
+                }
+            } else if (any_ok) {
+                mb_consec_fail = 0;
+                mb_reinit_count = 0;
             }
             next_send = now + (int64_t)cfg->telemetry_interval_s * 1000;
         }
@@ -363,6 +495,7 @@ static void run_ap_mode(void)
 
     wifi_mgr_start_ap(cfg->ap_ssid, cfg->ap_password);   // per-box SSID (e.g. Gravity_water_01)
     web_config_start();          // REST API for the Flutter app (§18 endpoint contract)
+    dns_server_start();          // captive portal: keep the phone from evicting this no-internet AP
     ESP_LOGI(TAG, "CONFIG MODE — join '%s', open the app to configure", cfg->ap_ssid);
 
     int64_t start = esp_timer_get_time();
@@ -383,6 +516,8 @@ static void run_ap_mode(void)
 
 void app_main(void)
 {
+    log_capture_init();   // mirror all ESP_LOG into a RAM ring → pullable via GET /logs over VPN
+
     // NVS init (required by config + wifi).
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -391,8 +526,17 @@ void app_main(void)
     }
 
     load_restart_count();
-    ESP_LOGI(TAG, "===== AquaGen Lite %s booting (recovery reboots: %lu) =====",
-             FW_VERSION_STRING, (unsigned long)s_restart_count);
+
+    // Boot-loop protection: bump the consecutive-unhealthy-boot counter now; it's cleared later
+    // once we've run healthy for a few minutes (run_station_mode). If it's too high, a crash is
+    // looping every boot → enter SAFE MODE (skip the risky meter path, keep remote access alive).
+    uint32_t boot_fail = boot_fail_get() + 1;
+    boot_fail_set(boot_fail);
+    s_safe_mode = (boot_fail > BOOT_FAIL_SAFE_THRESHOLD);
+
+    ESP_LOGI(TAG, "===== AquaGen Lite %s booting (recovery reboots: %lu, boot_fail: %lu%s) =====",
+             FW_VERSION_STRING, (unsigned long)s_restart_count, (unsigned long)boot_fail,
+             s_safe_mode ? " — SAFE MODE: meter disabled, remote access only" : "");
 
     leds_init();
     led_blink(LED_BLUE, 50, 2);
@@ -405,7 +549,9 @@ void app_main(void)
 
     // Factory-line METER SELF-TEST: read the meter once at boot and print PASS/FAIL on serial,
     // so right after flashing you instantly see if RS485 is wired correctly — no WiFi/app needed.
-    {
+    // SKIPPED in safe mode: a bad meter config is the most likely repeating-crash source, so we
+    // don't touch the Modbus path until the box has been remotely repaired.
+    if (!s_safe_mode) {
         app_config_t *mc = app_config_get();
         if (mc->meters[0].enabled) {
             meter_reading_t r = modbus_meter_read(&mc->meters[0], 2, 100);

@@ -21,6 +21,8 @@ idf_component_register(
         "ota.c"
         "web_config.c"
         "wireguard_client.c"
+        "log_capture.c"
+        "dns_server.c"
     INCLUDE_DIRS
         "."
         "../managed_components/trombik__esp_wireguard/src"

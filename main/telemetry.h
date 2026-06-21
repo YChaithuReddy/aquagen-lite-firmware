@@ -8,6 +8,10 @@
 
 void telemetry_init(void);   // mounts flash buffer
 
+// Tell telemetry whether the clock is NTP-authoritative yet, and this boot's id. While NOT
+// authoritative, buffered records are tagged provisional so they can be retimed once NTP arrives.
+void telemetry_set_clock(bool authoritative, unsigned boot_id);
+
 // Build the telemetry JSON for a reading + publish; if offline, queue to flash. Returns true if published live.
 bool telemetry_send(const meter_cfg_t *meter, const meter_reading_t *reading);
 

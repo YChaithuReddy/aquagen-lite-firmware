@@ -14,6 +14,16 @@ void flash_buffer_init(void);                 // mount LittleFS; call once at bo
 // Append one telemetry record (a complete JSON string). Drops oldest if over the cap.
 bool flash_buffer_push(const char *json);
 
+// Append a record whose timestamp is PROVISIONAL (clock not yet NTP-authoritative this boot).
+// Stores a hidden sidecar (boot_id + the epoch baked into created_on) so it can be corrected
+// exactly once the real clock arrives. The json is still published as-is if never corrected.
+bool flash_buffer_push_provisional(const char *json, unsigned boot_id, long long created_epoch);
+
+// Once the clock becomes authoritative, fix every provisional record from THIS boot: shift its
+// created_on by delta_sec (a single constant offset — a software-RTC clock runs at the right rate,
+// just offset by the downtime) and drop the sidecar. Records from other boots are left untouched.
+void flash_buffer_retime(unsigned boot_id, long long delta_sec);
+
 bool flash_buffer_is_empty(void);
 size_t flash_buffer_count(void);
 

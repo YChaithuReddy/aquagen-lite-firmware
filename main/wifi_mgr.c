@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -11,11 +12,19 @@
 
 static const char *TAG = "wifi";
 
+// Reconnect attempts inside a single connect call before reporting failure.
+// Power-on timing (router still booting, RF calibration, DHCP not ready) can make
+// the FIRST attempt drop with WIFI_EVENT_STA_DISCONNECTED — retrying recovers it
+// without a manual reboot.
+#define WIFI_MAX_RETRY      3
+#define WIFI_RETRY_DELAY_MS 800
+
 static EventGroupHandle_t s_events;
 #define BIT_GOT_IP    BIT0
 #define BIT_FAIL      BIT1
 
 static bool s_connected = false;
+static int  s_retry = 0;
 static esp_netif_t *s_sta_netif = NULL;
 static esp_netif_t *s_ap_netif  = NULL;
 
@@ -23,7 +32,15 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_connected = false;
-        xEventGroupSetBits(s_events, BIT_FAIL);
+        if (s_retry < WIFI_MAX_RETRY) {
+            s_retry++;
+            ESP_LOGW(TAG, "disconnected — retry %d/%d", s_retry, WIFI_MAX_RETRY);
+            vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_DELAY_MS));  // let the AP/router settle
+            esp_wifi_connect();
+        } else {
+            ESP_LOGE(TAG, "disconnected — %d retries exhausted, giving up this attempt", WIFI_MAX_RETRY);
+            xEventGroupSetBits(s_events, BIT_FAIL);
+        }
     }
 }
 
@@ -31,6 +48,7 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
 {
     if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         s_connected = true;
+        s_retry = 0;                  // fresh budget for the next disconnect
         xEventGroupSetBits(s_events, BIT_GOT_IP);
     }
 }
@@ -60,10 +78,12 @@ bool wifi_mgr_connect_sta(const char *ssid, const char *password, int timeout_ms
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
     esp_wifi_set_ps(WIFI_PS_NONE);          // disable power save (matches old firmware)
-    ESP_LOGI(TAG, "connecting to '%s'...", ssid);
+
+    s_retry = 0;                            // fresh retry budget for this attempt
+    xEventGroupClearBits(s_events, BIT_GOT_IP | BIT_FAIL);
+    ESP_LOGI(TAG, "connecting to '%s'... (up to %d retries)", ssid, WIFI_MAX_RETRY);
     esp_wifi_connect();
 
-    xEventGroupClearBits(s_events, BIT_GOT_IP | BIT_FAIL);
     EventBits_t bits = xEventGroupWaitBits(s_events, BIT_GOT_IP | BIT_FAIL,
                                            pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
     if (bits & BIT_GOT_IP) {
@@ -90,10 +110,29 @@ void wifi_mgr_start_ap(const char *ssid, const char *password)
     wc.ap.max_connection = 4;
     wc.ap.authmode = (strlen(password) >= 8) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));   // AP + STA so we can scan
+    // APSTA — matches modbus_iot_gateway (AP for the phone + STA so /scan_wifi works).
+    // Hotspot stability comes from the captive-portal handling (DNS + generate_204), which
+    // stops Android from evicting this no-internet AP — not from the wifi mode.
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "SoftAP '%s' up at 192.168.4.1 (APSTA — scan enabled)", ssid);
+    esp_wifi_set_ps(WIFI_PS_NONE);   // no power-save → steadier AP beacons/responses
+
+    // Captive portal: hand out 192.168.4.1 as the DHCP DNS server so the phone's
+    // connectivity-check lookups hit our DNS responder (dns_server.c). Without this the
+    // phone keeps its old DNS, never queries us, and Android evicts the no-internet AP.
+    {
+        esp_netif_dns_info_t dns = { 0 };
+        dns.ip.u_addr.ip4.addr = ESP_IP4TOADDR(192, 168, 4, 1);
+        dns.ip.type = ESP_IPADDR_TYPE_V4;
+        uint8_t offer_dns = 2;   // DHCPS_OFFER_DNS
+        esp_netif_dhcps_stop(s_ap_netif);
+        esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns);
+        esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET,
+                               ESP_NETIF_DOMAIN_NAME_SERVER, &offer_dns, sizeof(offer_dns));
+        esp_netif_dhcps_start(s_ap_netif);
+    }
+    ESP_LOGI(TAG, "SoftAP '%s' up at 192.168.4.1 (APSTA + captive portal)", ssid);
 }
 
 void wifi_mgr_stop(void)

@@ -5,6 +5,7 @@
 #include "iot_configs.h"
 #include "ota.h"
 #include "azure_mqtt.h"
+#include "log_capture.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,6 +90,7 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddNumberToObject(mb, "timeouts", (double)ms->timeouts);
     cJSON_AddNumberToObject(mb, "crc_errors", (double)ms->crc_errors);
     cJSON_AddNumberToObject(mb, "last_exception", (double)ms->last_exception);
+    cJSON_AddNumberToObject(mb, "recoveries", (double)ms->recoveries);
     cJSON *meters = cJSON_AddArrayToObject(r, "meters");
     for (int i = 0; i < MAX_METERS; i++) {
         cJSON *m = cJSON_CreateObject();
@@ -105,6 +107,16 @@ static esp_err_t h_status(httpd_req_t *req)
     esp_err_t e = send_json(req, json);
     cJSON_free(json);
     return e;
+}
+
+// GET /logs — recent device log (the serial-monitor output), pullable remotely over the VPN.
+static esp_err_t h_logs(httpd_req_t *req)
+{
+    static char buf[6300];   // static: too big for the httpd task stack
+    size_t n = log_capture_dump(buf, sizeof(buf));
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, buf, n);
 }
 
 // GET /scan_wifi — list nearby networks.
@@ -130,6 +142,25 @@ static esp_err_t h_save_wifi(httpd_req_t *req)
     strlcpy(cfg->wifi_password, cJSON_IsString(pw) ? pw->valuestring : "", sizeof(cfg->wifi_password));
     cJSON_Delete(j);
     app_config_save();
+    return send_ok(req);
+}
+
+// POST /save_site  { "site_name": "...", "gps": "lat,lon" } — installer's site record (→ NVS → twin).
+static esp_err_t h_save_site(httpd_req_t *req)
+{
+    char *body = read_body(req);
+    if (!body) return send_err(req, "no body");
+    cJSON *j = cJSON_Parse(body); free(body);
+    if (!j) return send_err(req, "bad json");
+    app_config_t *cfg = app_config_get();
+    cJSON *it;
+    if ((it = cJSON_GetObjectItem(j, "site_name")) && cJSON_IsString(it))
+        strlcpy(cfg->site_name, it->valuestring, sizeof(cfg->site_name));
+    if ((it = cJSON_GetObjectItem(j, "gps")) && cJSON_IsString(it))
+        strlcpy(cfg->site_gps, it->valuestring, sizeof(cfg->site_gps));
+    cJSON_Delete(j);
+    app_config_save();
+    ESP_LOGI(TAG, "site saved: '%s' @ %s", cfg->site_name, cfg->site_gps);
     return send_ok(req);
 }
 
@@ -261,6 +292,17 @@ static esp_err_t h_options(httpd_req_t *req)
     return httpd_resp_sendstr(req, "");
 }
 
+// Captive-portal catch-all: any GET that doesn't match a real endpoint (the phone OS's
+// connectivity checks — Android /generate_204, Apple /hotspot-detect.html, Windows
+// /connecttest.txt) gets 204 No Content. The phone then treats this no-internet hotspot
+// as "online" and does NOT deauth/evict it — which is what made the box go unreachable.
+// Real routes are registered before this, so they take precedence (wildcard match order).
+static esp_err_t h_captive(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "204 No Content");
+    return httpd_resp_send(req, NULL, 0);
+}
+
 static void reg(const char *uri, httpd_method_t method, esp_err_t (*fn)(httpd_req_t *))
 {
     httpd_uri_t u = { .uri = uri, .method = method, .handler = fn };
@@ -277,8 +319,10 @@ void web_config_start(void)
 
     reg("/", HTTP_GET, h_root);
     reg("/api/system_status", HTTP_GET, h_status);
+    reg("/logs", HTTP_GET, h_logs);
     reg("/scan_wifi", HTTP_GET, h_scan);
     reg("/save_wifi", HTTP_POST, h_save_wifi);
+    reg("/save_site", HTTP_POST, h_save_site);
     reg("/save_azure", HTTP_POST, h_save_azure);
     reg("/save_meters", HTTP_POST, h_save_meters);
     reg("/save_settings", HTTP_POST, h_save_settings);
@@ -286,6 +330,7 @@ void web_config_start(void)
     reg("/ota", HTTP_POST, h_ota);
     reg("/reboot", HTTP_POST, h_reboot);
     reg("/*", HTTP_OPTIONS, h_options);   // CORS preflight
+    reg("/*", HTTP_GET, h_captive);       // captive-portal catch-all (must be last GET)
     ESP_LOGI(TAG, "REST API started on :80");
 }
 
