@@ -1013,6 +1013,10 @@ esp_err_t wireguard_register_http_handlers(httpd_handle_t server)
     esp_err_t err = httpd_register_uri_handler(server, &uri);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "Registered /vpn-status handler");
+    } else if (err == ESP_ERR_HTTPD_HANDLER_EXISTS) {
+        // Already registered on this server (e.g. handle reused after a stop/start). That's fine —
+        // treat as success so ensure_status_handler_registered() stops re-trying every 10s.
+        err = ESP_OK;
     } else {
         ESP_LOGW(TAG, "Failed to register /vpn-status: %s", esp_err_to_name(err));
     }
