@@ -109,6 +109,13 @@ void wifi_mgr_start_ap(const char *ssid, const char *password)
     strlcpy((char *)wc.ap.password, password, sizeof(wc.ap.password));
     wc.ap.max_connection = 4;
     wc.ap.authmode = (strlen(password) >= 8) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    // Disable 802.11w (Protected Management Frames) on the config SoftAP. ESP-IDF 5.x defaults
+    // the SoftAP to PMF-capable, which makes the AP run an "SA Query" against the phone and then
+    // DISASSOCIATE it (reason 209) when the phone doesn't answer — exactly the join/leave churn
+    // that left the operator unable to reach 192.168.4.1. Older firmware (older IDF) had PMF off,
+    // which is why setup worked before. Plain WPA2-PSK with PMF off is the most phone-compatible.
+    wc.ap.pmf_cfg.capable  = false;
+    wc.ap.pmf_cfg.required = false;
 
     // APSTA — matches modbus_iot_gateway (AP for the phone + STA so /scan_wifi works).
     // Hotspot stability comes from the captive-portal handling (DNS + generate_204), which
