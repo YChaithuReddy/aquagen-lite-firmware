@@ -13,7 +13,7 @@ code=$(curl -sL -o /dev/null -w "%{http_code}" --max-time 30 "$URL")
 [ "$code" = "200" ] || { echo "❌ release asset not found (http=$code). Publish the GitHub release first."; exit 1; }
 echo "    asset OK (http 200)"
 
-DEVS=$("$AZ" iot hub device-identity list --login "$CONN" --query "[].deviceId" -o tsv)
+DEVS=$("$AZ" iot hub device-identity list --login "$CONN" --query "[?starts_with(deviceId, 'Gravity_water')].deviceId" -o tsv)
 n=0; ok=0
 for d in $DEVS; do
   n=$((n+1))
