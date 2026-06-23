@@ -332,11 +332,18 @@ static void run_station_mode(void)
                 s_config_active = !s_config_active;
                 g_web_open_req = s_config_active;  // wake task starts/stops the web server (no reboot)
                 if (s_config_active) {
-                    ESP_LOGW(TAG, "config button — opening config web UI (reach it on the box's LAN/VPN IP)");
+                    // Raise the SoftAP hotspot too (APSTA keeps the box ONLINE on site WiFi), so an
+                    // operator on-site can reconnect with the setup app even when site WiFi/VPN is down
+                    // — that's exactly when on-site reconfig is needed. Web UI also stays reachable on
+                    // the LAN/VPN IP for remote admin. Previously the button only opened the web server
+                    // on the existing IP, so a provisioned box raised no hotspot and the app saw nothing.
+                    wifi_mgr_start_ap(cfg->ap_ssid, cfg->ap_password);
+                    ESP_LOGW(TAG, "config button — SoftAP '%s' up (192.168.4.1) + web UI on LAN/VPN", cfg->ap_ssid);
                     leds_state_ap_mode();
                     led_set(LED_BLUE, true);
                 } else {
-                    ESP_LOGW(TAG, "config button — closing config web UI");
+                    wifi_mgr_stop_ap();   // drop the hotspot, KEEP the station connection (telemetry)
+                    ESP_LOGW(TAG, "config button — SoftAP down, web UI closing");
                     led_set(LED_BLUE, false);
                     leds_state_wifi_ok();
                 }
@@ -350,6 +357,7 @@ static void run_station_mode(void)
                     ESP_LOGE(TAG, "heap critical (%lu) — closing config web server to recover",
                              (unsigned long)esp_get_free_heap_size());
                     g_web_open_req = false;   // wake task stops the server
+                    wifi_mgr_stop_ap();       // drop the hotspot too, reclaim its memory
                     led_set(LED_BLUE, false);
                     leds_state_wifi_ok();
                     s_config_active = false;
@@ -373,6 +381,7 @@ static void run_station_mode(void)
         if (g_web_open_req && now - config_open_ms >= CONFIG_MODE_IDLE_TIMEOUT_MS) {
             ESP_LOGW(TAG, "config web UI open %d min — auto-closing", CONFIG_MODE_IDLE_TIMEOUT_MS / 60000);
             g_web_open_req = false;
+            wifi_mgr_stop_ap();       // drop the hotspot too on idle auto-close
             s_config_active = false;
             led_set(LED_BLUE, false);
             leds_state_wifi_ok();

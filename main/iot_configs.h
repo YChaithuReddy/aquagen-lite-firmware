@@ -9,7 +9,7 @@
 #define FW_VERSION_MAJOR 2
 #define FW_VERSION_MINOR 0
 #define FW_VERSION_PATCH 0
-#define FW_VERSION_STRING "2.3.7"
+#define FW_VERSION_STRING "2.3.8"
 
 // ---- Hardware pin map (keep identical to AquaGen board) ----
 #define PIN_RS485_RX     16   // UART2 RX  (Modbus)
