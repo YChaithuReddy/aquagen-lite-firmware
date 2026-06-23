@@ -26,6 +26,8 @@ void flash_buffer_retime(unsigned boot_id, long long delta_sec);
 
 bool flash_buffer_is_empty(void);
 size_t flash_buffer_count(void);
+size_t flash_buffer_bytes(void);   // total bytes used by the log file
+void   flash_buffer_clear(void);   // wipe the entire log file
 
 /**
  * Replay buffered records oldest-first. For each record, `send(json, ctx)` is called;

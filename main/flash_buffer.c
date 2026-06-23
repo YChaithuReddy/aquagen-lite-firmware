@@ -152,6 +152,19 @@ size_t flash_buffer_count(void)
     return n;
 }
 
+size_t flash_buffer_bytes(void)
+{
+    long s = file_size(LOG_PATH);
+    return s > 0 ? (size_t)s : 0;
+}
+
+void flash_buffer_clear(void)
+{
+    if (!s_mounted) return;
+    remove(LOG_PATH);
+    ESP_LOGI(TAG, "buffer cleared");
+}
+
 size_t flash_buffer_replay(flash_buffer_send_fn send, void *ctx)
 {
     if (!s_mounted) return 0;

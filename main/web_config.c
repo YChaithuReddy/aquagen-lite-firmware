@@ -6,6 +6,8 @@
 #include "ota.h"
 #include "azure_mqtt.h"
 #include "log_capture.h"
+#include "flash_buffer.h"
+#include "esp_timer.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +19,23 @@
 
 static const char *TAG = "webcfg";
 static httpd_handle_t s_server = NULL;
+
+extern uint32_t app_restart_count(void);   // main.c — unhealthy self-recovery reboots
+extern bool     app_safe_mode(void);        // main.c — boot-loop protection tripped
+
+static const char *_reset_reason_str(void)
+{
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "power-on";
+    case ESP_RST_SW:       return "sw-reboot";
+    case ESP_RST_PANIC:    return "panic";
+    case ESP_RST_INT_WDT:  return "int-wdt";
+    case ESP_RST_TASK_WDT: return "task-wdt";
+    case ESP_RST_WDT:      return "wdt";
+    case ESP_RST_BROWNOUT: return "brownout";
+    default:               return "other";
+    }
+}
 
 // Defined in main.c — queues an OTA to run from the main task (can't stop MQTT from the httpd task).
 extern void ota_request(const char *url);
@@ -102,6 +121,13 @@ static esp_err_t h_status(httpd_req_t *req)
         cJSON_AddBoolToObject(m, "enabled", cfg->meters[i].enabled);
         cJSON_AddItemToArray(meters, m);
     }
+    cJSON_AddBoolToObject(r, "mqtt_connected", azure_mqtt_is_connected());
+    cJSON_AddBoolToObject(r, "safe_mode", app_safe_mode());
+    cJSON_AddNumberToObject(r, "restart_count", (double)app_restart_count());
+    cJSON_AddStringToObject(r, "reset_reason", _reset_reason_str());
+    cJSON_AddNumberToObject(r, "uptime_sec", (double)(esp_timer_get_time() / 1000000));
+    cJSON_AddNumberToObject(r, "buffer_queued", (double)flash_buffer_count());
+    cJSON_AddNumberToObject(r, "buffer_bytes", (double)flash_buffer_bytes());
     char *json = cJSON_PrintUnformatted(r);
     cJSON_Delete(r);
     esp_err_t e = send_json(req, json);
@@ -303,6 +329,64 @@ static esp_err_t h_captive(httpd_req_t *req)
     return httpd_resp_send(req, NULL, 0);
 }
 
+// GET /api/ota_status — lets the app poll OTA download state.
+static esp_err_t h_ota_status(httpd_req_t *req)
+{
+    char buf[80];
+    snprintf(buf, sizeof(buf), "{\"state\":\"%s\",\"in_progress\":%s}",
+             ota_status_str(), ota_in_progress() ? "true" : "false");
+    return send_json(req, buf);
+}
+
+// GET /api/buffer_status — offline buffer size (lets the app show queued count).
+static esp_err_t h_buffer_status(httpd_req_t *req)
+{
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"count\":%u,\"bytes\":%u}",
+             (unsigned)flash_buffer_count(), (unsigned)flash_buffer_bytes());
+    return send_json(req, buf);
+}
+
+// POST /api/buffer_clear — wipe the offline buffer (useful during testing).
+static esp_err_t h_buffer_clear(httpd_req_t *req)
+{
+    flash_buffer_clear();
+    ESP_LOGW(TAG, "offline buffer cleared via web");
+    return send_ok(req);
+}
+
+// POST /api/clear_network — clear WiFi creds only, keep Azure identity.
+// Used by the pre-ship "reset to ship state" step so the box ships in hotspot mode.
+static esp_err_t h_clear_network(httpd_req_t *req)
+{
+    app_config_clear_network_keep_identity();
+    ESP_LOGW(TAG, "network config cleared (identity kept) — rebooting");
+    send_ok(req);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
+}
+
+// POST /api/factory_reset  { "confirm": "RESET" } — full NVS wipe.
+// Requires confirmation string to prevent accidental trigger.
+static esp_err_t h_factory_reset(httpd_req_t *req)
+{
+    char *body = read_body(req);
+    if (!body) return send_err(req, "no body");
+    cJSON *j = cJSON_Parse(body); free(body);
+    if (!j) return send_err(req, "bad json");
+    cJSON *c = cJSON_GetObjectItem(j, "confirm");
+    bool ok = c && cJSON_IsString(c) && strcmp(c->valuestring, "RESET") == 0;
+    cJSON_Delete(j);
+    if (!ok) return send_err(req, "send {\"confirm\":\"RESET\"} to confirm");
+    ESP_LOGW(TAG, "factory reset via web — wiping all NVS and rebooting");
+    send_ok(req);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    app_config_factory_reset();
+    esp_restart();
+    return ESP_OK;
+}
+
 static void reg(const char *uri, httpd_method_t method, esp_err_t (*fn)(httpd_req_t *))
 {
     httpd_uri_t u = { .uri = uri, .method = method, .handler = fn };
@@ -313,7 +397,7 @@ void web_config_start(void)
 {
     if (s_server) return;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 24;
+    cfg.max_uri_handlers = 32;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     if (httpd_start(&s_server, &cfg) != ESP_OK) { ESP_LOGE(TAG, "httpd start failed"); return; }
 
@@ -329,6 +413,11 @@ void web_config_start(void)
     reg("/test_meter", HTTP_POST, h_test_meter);
     reg("/ota", HTTP_POST, h_ota);
     reg("/reboot", HTTP_POST, h_reboot);
+    reg("/api/ota_status",    HTTP_GET,  h_ota_status);
+    reg("/api/buffer_status", HTTP_GET,  h_buffer_status);
+    reg("/api/buffer_clear",  HTTP_POST, h_buffer_clear);
+    reg("/api/clear_network", HTTP_POST, h_clear_network);
+    reg("/api/factory_reset", HTTP_POST, h_factory_reset);
     reg("/*", HTTP_OPTIONS, h_options);   // CORS preflight
     reg("/*", HTTP_GET, h_captive);       // captive-portal catch-all (must be last GET)
     ESP_LOGI(TAG, "REST API started on :80");
