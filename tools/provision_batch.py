@@ -83,11 +83,17 @@ def build_nvs_bin(idf_path, csv_path, bin_path, size="0x9000"):
     subprocess.run(cmd, check=True)
 
 
+# Landing page that an app-less phone reaches when it scans the QR with its camera
+# (shows the box + an APK download button). The operator app's in-app scanner reads the
+# ?d= box id from this same URL and joins (password defaults to Config123).
+QR_LANDING_BASE = "https://ychaithureddy.github.io/aquagen-setup/?d="
+
+
 def make_qr(path, ap_ssid, ap_password, device_id):
     import qrcode
-    # Payload the Flutter app parses on scan.
-    payload = json.dumps({"ssid": ap_ssid, "pw": ap_password, "did": device_id},
-                         separators=(",", ":"))
+    # URL payload: works BOTH ways from one QR — phone camera → download page,
+    # in-app scanner → auto-connect. The box id is the only thing it needs to carry.
+    payload = QR_LANDING_BASE + device_id
     img = qrcode.make(payload)
     img.save(path)
 
